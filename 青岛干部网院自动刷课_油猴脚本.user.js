@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         青岛干部网络学院 - 自动课程学习助手
 // @namespace    https://www.qdgbjy.gov.cn/
-// @version      3.2.9
+// @version      3.3.5
 // @description  普通课程与网上专题班手动分流学习，两个流程互不干扰，并与可选桌面端同步状态。
 // @author       Antigravity
 // @match        https://qdgbjy.gov.cn/*
@@ -22,7 +22,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '3.2.9';
+  const VERSION = '3.3.5';
   const PERSON_URL = 'https://www.qdgbjy.gov.cn/person';
   const STORAGE_KEY_AUTO = 'qdgbjy_auto_study_enabled_v3';
   const STORAGE_KEY_STUDY_MODE = 'qdgbjy_study_mode_v311';
@@ -32,8 +32,19 @@
   const STORAGE_KEY_SPECIAL_DONE = 'qdgbjy_special_classes_done_v311';
   const STORAGE_KEY_SPECIAL_SCAN = 'qdgbjy_special_scan_done_v311';
   const STORAGE_KEY_SPECIAL_SKIP = 'qdgbjy_special_skipped_v316';
+  const STORAGE_KEY_ACCOUNT_SCOPE = 'qdgbjy_current_account_scope_v335';
   const COURSE_LAUNCH_TIMEOUT = 120000;
   const COURSE_ACTIVE_TIMEOUT = 6 * 60 * 60 * 1000;
+  const VIDEO_STALL_WARNING_MS = 120 * 1000;
+  const VIDEO_RELOAD_MS = 180 * 1000;
+  const PLATFORM_PROGRESS_WARNING_MS = 15 * 60 * 1000;
+  const RELOAD_RETRY_WINDOW_MS = 24 * 60 * 60 * 1000;
+  const MAX_STALL_RELOADS = 1;
+  // Two qualifying timer gaps without meaningful progress, or a single severe gap.
+  // Mere background throttling with ongoing playback is not a fault.
+  const TIMING_GAP_MS = 45 * 1000;
+  const TIMING_SEVERE_GAP_MS = 10 * 60 * 1000;
+  const MAX_TIMING_REENTRIES = 2;
   const SPECIAL_DONE_TTL = 6 * 60 * 60 * 1000;
   const SPECIAL_SCAN_TTL = 30 * 60 * 1000;
   const TAB_ID = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -65,7 +76,142 @@
     skippingCourse: false,
     lastSkipClickAt: 0,
     paginationAttempt: null,
+    diagnostics: {},
+    pendingEvents: [],
+    eventCounter: 0,
+    watchdog: null,
+    progressMeta: { source: 'unknown', siteProgress: '' },
+    lastMismatchKey: '',
+    watchdogReloading: false,
+    terminalIssue: '',
+    specialPopup: null,
+    recoveryAck: null,
+    lastDesktopRecoveryId: '',
+    desktopGuardianAvailable: false,
+    accountKey: '',
+    accountInvalidated: false,
   };
+
+  // The class list keeps a WindowProxy for the course tab when it is script-opened.
+  // A frozen child cannot run window.close(), but its living opener can close
+  // the *specific* child. Never send Ctrl+W or close an unidentified tab.
+  function setupSpecialPopupOwnership() {
+    if (!IS_TOP) return;
+    window.addEventListener('message', (event) => {
+      if (!event.data || event.data.qdgbjy !== 'child-ready-333') return;
+      try {
+        const host = new URL(event.origin).hostname;
+        if (host !== 'qdgbjy.gov.cn' && !host.endsWith('.qdgbjy.gov.cn')) return;
+      } catch (_error) { return; }
+      if (getStudyMode() !== 'special' || !/\/trainDetail(?:\/|$)/i.test(location.pathname)) return;
+      const classId = new URL(location.href).searchParams.get('trainClassId') || '';
+      if (!classId || classId !== event.data.classId || !event.source) return;
+      const lock = readCourseLock();
+      const courseKey = String(event.data.courseKey || '');
+      if (!lock || !courseKey || lock.title !== courseKey ||
+          !['active', 'launching'].includes(lock.status)) return;
+      state.specialPopup = { handle: event.source, tabId: String(event.data.tabId || ''),
+        courseKey, classId, at: Date.now() };
+    });
+    // Site JavaScript often calls window.open() on a course-row click.
+    // Preserve the native behavior and merely retain the returned window handle.
+    try {
+      const site = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+      if (!site.open.__qdgbjyTracked333) {
+        const original = site.open;
+        const tracked = function (...args) {
+          const popup = original.apply(this, args);
+          if (popup && state.mode === 'special-class' && getStudyMode() === 'special') {
+            const lock = readCourseLock();
+            if (lock?.status === 'launching' && lock.title) {
+              state.specialPopup = { handle: popup, tabId: '', courseKey: lock.title,
+                classId: new URL(location.href).searchParams.get('trainClassId') || '', at: Date.now() };
+            }
+          }
+          return popup;
+        };
+        tracked.__qdgbjyTracked333 = true;
+        site.open = tracked;
+      }
+    } catch (_error) {}
+  }
+
+  function identifySpecialChild() {
+    if (!IS_TOP || state.mode !== 'detail' || getStudyMode() !== 'special') return;
+    try {
+      if (!window.opener || window.opener.closed) return;
+      const context = resolvedCourseReturnContext();
+      const classId = new URL(location.href).searchParams.get('trainClassId') || '';
+      if (context?.kind !== 'special' || !context.courseTitle || !classId) return;
+      window.opener.postMessage({ qdgbjy: 'child-ready-333', tabId: TAB_ID,
+        courseKey: context.courseTitle, classId }, '*');
+    } catch (_error) {}
+  }
+
+  // Only the active class-list tab receives this command from the desktop bridge.
+  function handleDesktopRecovery(request) {
+    if (!IS_TOP || state.mode !== 'special-class' || getStudyMode() !== 'special' ||
+        !getAutoEnabled() || !request || !request.id ||
+        request.id === state.lastDesktopRecoveryId) return;
+    state.lastDesktopRecoveryId = request.id;
+    const active = readCourseLock();
+    const popup = state.specialPopup;
+    const classId = new URL(location.href).searchParams.get('trainClassId') || '';
+    const matched = active?.title === request.courseKey &&
+      ['active', 'launching'].includes(active.status) &&
+      popup?.courseKey === request.courseKey && popup.classId === classId &&
+      classId === request.classId &&
+      popup.tabId === request.tabId && popup.handle;
+    const failure = (message) => {
+      state.recoveryAck = { id: request.id, status: 'failed', reason: message };
+      state.terminalIssue = `课程异常恢复需要人工处理：${message}`;
+      state.message = state.terminalIssue;
+      recordDiagnosticEvent('warning', state.terminalIssue, request.courseKey);
+      setAutoEnabled(false);
+    };
+    if (!matched) {
+      failure('未能确认课程标签窗口句柄和当前课程身份，禁止误关其他标签。');
+      return;
+    }
+    if (visibleLearningDialog()) {
+      failure('页面存在需要人工确认的弹窗。');
+      return;
+    }
+    const retry = getTimingRetry(request.courseKey);
+    if (retry.count >= MAX_TIMING_REENTRIES) {
+      failure('24小时内重新进入次数已达上限。');
+      return;
+    }
+    try {
+      if (popup.handle.closed) {
+        // A tab was closed independently; do not reopen until list is refreshed.
+        recordDiagnosticEvent('recovery', '原课程标签已关闭，刷新专题班列表核实进度。', request.courseKey);
+      } else {
+        popup.handle.close();
+      }
+    } catch (_error) {
+      failure('浏览器拒绝关闭课程标签。');
+      return;
+    }
+    setTimeout(() => {
+      let closed = false;
+      try { closed = Boolean(popup.handle.closed); } catch (_error) {}
+      if (!closed) { failure('浏览器未允许关闭课程标签；保留原标签，暂停自动操作。'); return; }
+      writeLocalJson(retry.key, { count: retry.count + 1, at: Date.now() });
+      state.recoveryAck = { id: request.id, status: 'closed', reason: '' };
+      // Successful recovery must not alter the user's running/mode choice.
+      state.specialPopup = null;
+      clearCourseLock();
+      recordDiagnosticEvent('recovery',
+        `桌面守护识别课程${request.courseKey}停滞；已确认关闭原标签（第${retry.count + 1}/${MAX_TIMING_REENTRIES}次），返回专题班列表重新核对进度。`, request.courseKey);
+      state.message = '已关闭停滞的课程标签，正在保持专题班模式并重新读取课程列表。';
+      recordDiagnosticEvent('recovery',
+        `已确认关页；当前专题班模式=${getStudyMode()}，运行开关=${getAutoEnabled() ? '开启' : '暂停'}。`, request.courseKey);
+      updateFloatingUI();
+      setTimeout(() => syncBridge(), 100);
+      setTimeout(() => location.reload(), 2200);
+    }, 500);
+  }
 
   // Observe the site's own list response and current page; do not send extra requests.
   function observeSpecialCourseResponse() {
@@ -149,6 +295,113 @@
     try {
       localStorage.removeItem(key);
     } catch (_error) {}
+  }
+
+  // Legacy v3.3.4 stored class/lock/recovery state for the entire site, not per
+  // login. A different login could inherit an hours-long active course lock.
+  // Identity is kept only as a short non-reversible local marker, not sent as
+  // account ID or authentication data to the desktop assistant.
+  function accountFingerprint() {
+    let identity = '';
+    for (const key of ['userInfo', 'user_info', 'user', 'currentUser', 'userData']) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw);
+        const value = parsed?.userInfo || parsed?.user || parsed?.data?.userInfo || parsed?.data?.user || parsed?.data || parsed;
+        if (!value || typeof value !== 'object') continue;
+        const stableId = value.userId ?? value.user_id ?? value.id ?? value.loginName ?? value.login_name ?? value.account;
+        const label = value.userName ?? value.username ?? value.name ?? value.realName ?? value.xm;
+        if (stableId != null && String(stableId).trim()) { identity = `id:${String(stableId).trim()}`; break; }
+        if (label && String(label).trim()) { identity = `name:${String(label).trim()}`; break; }
+      } catch (_ignored) {}
+    }
+    if (!identity) {
+      const element = document.querySelector('.user-name, .username, [class*="user_name"], [class*="real-name"]');
+      const label = textOf(element);
+      if (label && label.length <= 100 && !/登录|退出|游客|欢迎/.test(label)) identity = `name:${label}`;
+    }
+    if (!identity) return '';
+    let hash = 2166136261;
+    for (const char of identity) { hash ^= char.charCodeAt(0); hash = Math.imul(hash, 16777619); }
+    return `u${(hash >>> 0).toString(16)}`;
+  }
+
+  function clearAccountWorkflow(clearHistory = false) {
+    for (const key of [STORAGE_KEY_COURSE_LOCK, STORAGE_KEY_COURSE_RETURN,
+      STORAGE_KEY_SPECIAL_CLASS, STORAGE_KEY_SPECIAL_SCAN]) removeLocalValue(key);
+    if (clearHistory) {
+      removeLocalValue(STORAGE_KEY_SPECIAL_DONE);
+      removeLocalValue(STORAGE_KEY_SPECIAL_SKIP);
+    }
+    try {
+      for (const key of Object.keys(localStorage)) {
+        if (key.startsWith('qdgbjy_timing_reentry_v332_') ||
+            key.startsWith('qdgbjy_video_retries_')) localStorage.removeItem(key);
+      }
+      for (const key of Object.keys(sessionStorage)) {
+        if (key.startsWith('qdgbjy_special_resume_page_v316_')) sessionStorage.removeItem(key);
+      }
+    } catch (_ignored) {}
+    state.specialPopup = null;
+    state.recoveryAck = null;
+    state.currentSpecialTarget = null;
+    state.specialApiCourses = [];
+    state.specialApiLoading = false;
+    state.specialApiSeen = false;
+    state.paginationAttempt = null;
+    state.watchdog = null;
+    state.terminalIssue = '';
+    state.actionLockedUntil = 0;
+  }
+
+  function switchAccountHistory(previousKey, nextKey) {
+    // Preserve manual exclusions and recently-completed scans separately per
+    // user, rather than exposing them to a different login or losing them.
+    for (const key of [STORAGE_KEY_SPECIAL_DONE, STORAGE_KEY_SPECIAL_SKIP]) {
+      const perUser = (account) => `${key}_account_${account}`;
+      if (previousKey) {
+        const value = readLocalJson(key, null);
+        if (value !== null) writeLocalJson(perUser(previousKey), value);
+      }
+      removeLocalValue(key);
+      const restored = nextKey ? readLocalJson(perUser(nextKey), null) : null;
+      if (restored !== null) writeLocalJson(key, restored);
+    }
+  }
+
+  function checkAccountSwitch() {
+    // The identity in localStorage may still belong to the prior login while
+    // the server presents its sign-in page. Never treat it as an active login.
+    if (state.mode === 'login') {
+      if (state.accountKey) {
+        state.accountKey = '';
+        state.accountInvalidated = false;
+        clearAccountWorkflow(false);
+        recordDiagnosticEvent('account', '检测到登录页面，已解除旧课程活动锁；等待新账号登录。', '');
+      }
+      return true;
+    }
+    const current = accountFingerprint();
+    if (!current) return true; // Login/profile not ready; do not guess an account.
+    if (state.accountKey && state.accountKey !== current && state.mode === 'detail') {
+      // An old account's open video must not control the newly signed-in user.
+      state.accountInvalidated = true;
+      state.message = '账号已切换；旧账号课程窗口已停止接管，请返回新账号的班级列表。';
+      return false;
+    }
+    if (state.accountInvalidated) return false;
+    const previous = readLocalJson(STORAGE_KEY_ACCOUNT_SCOPE, {})?.key || '';
+    if (previous !== current) {
+      // Includes one-off migration from 3.3.4, whose unscoped locks were unsafe.
+      switchAccountHistory(previous, current);
+      clearAccountWorkflow(false);
+      writeLocalJson(STORAGE_KEY_ACCOUNT_SCOPE, { key: current, at: Date.now() });
+      recordDiagnosticEvent('account', '识别到新登录账号，已隔离旧课程锁与专题班缓存；学习模式设置保持不变。', '');
+      state.message = '账号已切换，已清理旧账号课程状态，等待当前账号的班级列表。';
+    }
+    state.accountKey = current;
+    return true;
   }
 
   function specialClassKey(url = location.href) {
@@ -334,17 +587,25 @@
       if (!raw) return null;
       const value = JSON.parse(raw);
       if (!value || typeof value.status !== 'string' || typeof value.at !== 'number') return null;
+      if (value.accountKey && state.accountKey && value.accountKey !== state.accountKey) return null;
       return value;
     } catch (_error) {
       return null;
     }
   }
 
-  function writeCourseLock(status, title = '') {
+  function writeCourseLock(status, title = '', observedActivity = false) {
     try {
+      const previous = readCourseLock();
+      const inherited = previous?.owner === TAB_ID && previous.title === title &&
+        Number.isFinite(previous.lastActivityAt) ? previous.lastActivityAt : Date.now();
       localStorage.setItem(
         STORAGE_KEY_COURSE_LOCK,
-        JSON.stringify({ status, title: String(title || '').slice(0, 300), at: Date.now(), owner: TAB_ID })
+        JSON.stringify({
+          status, title: String(title || '').slice(0, 300), at: Date.now(), owner: TAB_ID,
+          accountKey: state.accountKey,
+          lastActivityAt: observedActivity ? Date.now() : inherited,
+        })
       );
     } catch (_error) {}
   }
@@ -355,14 +616,16 @@
         const lock = readCourseLock();
         if (lock?.owner && lock.owner !== owner) return;
       }
+      const existing = readCourseLock();
+      if (!existing && state.accountKey && localStorage.getItem(STORAGE_KEY_COURSE_LOCK)) return;
       localStorage.removeItem(STORAGE_KEY_COURSE_LOCK);
     } catch (_error) {}
   }
 
   function releaseOwnedCourseLock() {
-    if (state.mode !== 'detail') return;
+    if (state.mode !== 'detail' || state.watchdogReloading) return;
     const lock = readCourseLock();
-    if (lock?.status === 'active' && lock.owner === TAB_ID) {
+    if (['active', 'stalled'].includes(lock?.status) && lock.owner === TAB_ID) {
       writeCourseLock('closed', lock.title || state.courseTitle);
     }
   }
@@ -372,10 +635,260 @@
     if (!lock) return null;
     const age = Date.now() - lock.at;
     const timeout = lock.status === 'launching' ? COURSE_LAUNCH_TIMEOUT : COURSE_ACTIVE_TIMEOUT;
-    if (lock.status === 'completed' || lock.status === 'closed' || lock.status === 'skipped') return lock;
+    if (['completed', 'closed', 'skipped', 'stalled'].includes(lock.status)) return lock;
     if ((lock.status === 'launching' || lock.status === 'active') && age < timeout) return lock;
     clearCourseLock();
     return null;
+  }
+
+  function recordDiagnosticEvent(kind, message, course = state.courseTitle) {
+    state.eventCounter += 1;
+    state.pendingEvents.push({
+      id: `${TAB_ID}-${state.eventCounter}`,
+      kind, message: String(message).slice(0, 500),
+      course: String(course || '').slice(0, 300),
+    });
+    // Only retain bounded diagnostics while the optional desktop program is offline.
+    if (state.pendingEvents.length > 32) state.pendingEvents.splice(0, state.pendingEvents.length - 32);
+    console.warn(`[青岛网院助手/${kind}] ${message}`);
+  }
+
+  function visibleLearningDialog() {
+    const dialog = document.querySelector(
+      '[role="dialog"], .el-dialog, .ant-modal, .layui-layer, .modal, [class*="dialog"]'
+    );
+    return Boolean(dialog && isVisible(dialog));
+  }
+
+  function playbackRetryKey(title) {
+    return `qdgbjy_watchdog_retry_v330_${getStudyMode()}_${encodeURIComponent(title).slice(0, 100)}`;
+  }
+
+  function getPlaybackRetry(title) {
+    const key = playbackRetryKey(title);
+    const saved = readLocalJson(key, {});
+    if (Number.isFinite(saved?.at) && Date.now() - saved.at < RELOAD_RETRY_WINDOW_MS) {
+      return { key, count: Number(saved.count) || 0 };
+    }
+    return { key, count: 0 };
+  }
+
+  function timingRetryKey(title) {
+    return `qdgbjy_timing_reentry_v332_${getStudyMode()}_${encodeURIComponent(title).slice(0, 100)}`;
+  }
+
+  function getTimingRetry(title) {
+    const key = timingRetryKey(title);
+    const saved = readLocalJson(key, {});
+    if (Number.isFinite(saved?.at) && Date.now() - saved.at < RELOAD_RETRY_WINDOW_MS) {
+      return { key, count: Number(saved.count) || 0 };
+    }
+    return { key, count: 0 };
+  }
+
+  // Let the platform's existing course list reopen an incomplete course.
+  // Never mark it finished or create an additional uncontrolled player tab.
+  function reenterSpecialCourseAfterTiming(watch, title, gapSeconds) {
+    if (getStudyMode() !== 'special' || watch.recovering || watch.terminal || state.closingCourse) return;
+    if (visibleLearningDialog()) {
+      recordDiagnosticEvent('warning', '检测到需要人工处理的页面弹窗；不自动关闭课程页。', title);
+      watch.timingStrikes = 0;
+      return;
+    }
+    // A responsive class-list opener can close this tab while the child is frozen.
+    // Avoid simultaneous self-close and parent-close for the same abnormal period.
+    if (state.bridgeConnected && state.desktopGuardianAvailable) {
+      if (!watch.awaitingGuardian) {
+        watch.awaitingGuardian = true;
+        recordDiagnosticEvent('timing', '已达到课程冻结异常阈值，桌面端及专题班列表页正在接管恢复。', title);
+      }
+      return;
+    }
+    const context = resolvedCourseReturnContext();
+    if (context?.kind !== 'special' || !context.url) {
+      recordDiagnosticEvent('warning', '未找到可靠的专题班返回地址，无法安全重新进入；请人工处理。', title);
+      watch.timingStrikes = 0;
+      return;
+    }
+    const retry = getTimingRetry(title);
+    if (retry.count >= MAX_TIMING_REENTRIES) {
+      watch.terminal = true;
+      state.terminalIssue = `课程“${title}”多次出现严重冻结，已达 ${MAX_TIMING_REENTRIES} 次自动重新进入上限；请人工检查。`;
+      writeCourseLock('stalled', title);
+      recordDiagnosticEvent('stalled', state.terminalIssue, title);
+      setAutoEnabled(false);
+      state.message = state.terminalIssue;
+      updateFloatingUI();
+      return;
+    }
+    watch.recovering = true;
+    state.watchdogReloading = true;
+    writeLocalJson(retry.key, { count: retry.count + 1, at: Date.now() });
+    writeCourseLock('closed', title);
+    recordDiagnosticEvent('recovery',
+      `专题班定时器有效异常累计 ${watch.timingStrikes} 次（最近间隔 ${gapSeconds} 秒）；自动重新进入第 ${retry.count + 1}/${MAX_TIMING_REENTRIES} 次：关闭课程标签并让原课程列表重新读取未完成进度。`, title);
+    state.message = '⚠ 检测到两次有效冻结，正在关闭当前课程页，随后从专题班列表重新进入。';
+    updateFloatingUI();
+    syncBridge();
+    // Do not clear return context until after this page has been replaced.
+    // If the course was not opened as a script-owned popup, navigation is safer
+    // than trying to force-close an unrelated browser tab.
+    setTimeout(() => {
+      if (window.opener && !window.opener.closed) {
+        window.close();
+        setTimeout(() => {
+          if (!window.closed) location.assign('about:blank');
+        }, 1200);
+      } else {
+        location.assign(context.url);
+      }
+    }, 3500);
+  }
+
+  // Diagnose video progress separately from the site's learning-credit progress.
+  // Never seek through a video, mark an unfinished section complete or dismiss a human check.
+  function observePlaybackHealth(sections, progress, title) {
+    const now = Date.now();
+    const current = sections.find((s) => s.current) ||
+      sections.find((s) => progressNumber(s.progress) < 100) || null;
+    const section = current?.title || '当前视频';
+    const reportedProgress = `${progress}|${current?.progress || ''}`;
+    const watchKey = `${getStudyMode()}|${location.pathname}|${location.search}|${title}|${section}`;
+    const video = Array.from(document.querySelectorAll('video')).find((v) => !v.ended) ||
+      document.querySelector('video');
+    let watch = state.watchdog;
+    if (!watch || watch.key !== watchKey) {
+      watch = {
+        key: watchKey, lastObservedAt: now, lastVideoTime: null, lastVideoAdvanceAt: now,
+        lastProgress: reportedProgress, lastProgressChangeAt: now, warnedVideo: false,
+        warnedProgress: false, warnedNoVideo: false, recovering: false, terminal: false,
+        stallAlertActive: false, everAdvanced: false, timingStrikes: 0,
+        lastReportedPercent: progressNumber(progress),
+      };
+      state.watchdog = watch;
+      recordDiagnosticEvent('course', `开始监测：${section} | 课程进度=${progress || '未知'}`, title);
+    }
+    const samplingGap = now - watch.lastObservedAt;
+    const previousVideoTime = watch.lastVideoTime;
+    const previousPercent = watch.lastReportedPercent;
+    // A long timer gap is not by itself a playback failure. Inspect how much
+    // actual playback/section credit changed across the missing interval.
+    const gapSeconds = Math.round(samplingGap / 1000);
+    if (samplingGap > TIMING_GAP_MS) watch.lastVideoAdvanceAt = now;
+    watch.lastObservedAt = now;
+    let observedActivity = false;
+    let videoAdvanced = false;
+    if (reportedProgress !== watch.lastProgress) {
+      observedActivity = true;
+      watch.lastProgress = reportedProgress;
+      watch.lastProgressChangeAt = now;
+      watch.warnedProgress = false;
+    }
+    const t = video ? Number(video.currentTime) : NaN;
+    const duration = video ? Number(video.duration) : NaN;
+    const videoTime = Number.isFinite(t) ? t : 0;
+    if (video && Number.isFinite(t)) {
+      if (watch.lastVideoTime === null || t > watch.lastVideoTime + 0.35 || t < watch.lastVideoTime - 4) {
+        if (watch.lastVideoTime !== null && t > watch.lastVideoTime + 0.35) {
+          watch.everAdvanced = true;
+          videoAdvanced = true;
+          observedActivity = true;
+        }
+        watch.lastVideoAdvanceAt = now;
+        watch.warnedVideo = false;
+      }
+      watch.lastVideoTime = t;
+    }
+    if (samplingGap > TIMING_GAP_MS) {
+      const videoGain = video && Number.isFinite(t) && Number.isFinite(previousVideoTime)
+        ? t - previousVideoTime : 0;
+      const creditGain = Math.max(0, progressNumber(progress) - previousPercent);
+      const meaningfulAdvance = samplingGap >= TIMING_SEVERE_GAP_MS
+        ? (videoGain >= 120 || creditGain >= 2)
+        : (videoGain >= Math.min(30, gapSeconds * 0.5) || creditGain >= 1);
+      const seriousGap = samplingGap >= TIMING_SEVERE_GAP_MS;
+      if (meaningfulAdvance) watch.timingStrikes = 0;
+      else watch.timingStrikes += seriousGap ? 2 : 1;
+      recordDiagnosticEvent('timing',
+        `诊断定时器中断 ${gapSeconds} 秒；期间视频推进 ${videoGain.toFixed(1)} 秒、学习进度变化 ${creditGain}%` +
+        `；${meaningfulAdvance ? '进度正常，不计入异常' : `有效异常累计 ${watch.timingStrikes}/2`}`, title);
+      if (watch.timingStrikes >= 2 && getStudyMode() === 'special' && !(video?.paused && !video.ended)) {
+        reenterSpecialCourseAfterTiming(watch, title, gapSeconds);
+      }
+    } else if (observedActivity) {
+      watch.timingStrikes = 0;
+    }
+    watch.lastReportedPercent = progressNumber(progress);
+    // Do not overwrite the 'closed' / 'stalled' lock with 'active' below.
+    if (watch.recovering || watch.terminal) return;
+    let status = 'waiting';
+    if (!video) status = 'no-video';
+    else if (video.ended) status = 'ended';
+    else if (video.paused) status = 'paused';
+    else if (video.seeking || video.readyState < 3) status = 'buffering';
+    else status = 'playing';
+    if (observedActivity) writeCourseLock('active', title, true);
+    const stalledSeconds = Math.max(0, Math.round((now - watch.lastVideoAdvanceAt) / 1000));
+    const progressIdleSeconds = Math.max(0, Math.round((now - watch.lastProgressChangeAt) / 1000));
+    const manualDialog = visibleLearningDialog();
+    const stalled = video && !video.ended && !video.paused && !video.seeking &&
+      stalledSeconds * 1000 >= VIDEO_STALL_WARNING_MS && !manualDialog;
+    if (stalled) status = 'warning';
+    state.diagnostics = {
+      progressSource: state.progressMeta?.source || 'unknown',
+      siteProgress: state.progressMeta?.siteProgress || '',
+      status, section, videoState: video ? status : 'missing',
+      videoTime: Number.isFinite(t) ? t.toFixed(1) : '-',
+      videoDuration: Number.isFinite(duration) ? duration.toFixed(1) : '-',
+      stalledSeconds, progressIdleSeconds, documentHidden: document.hidden,
+      timingStrikes: watch.timingStrikes,
+    };
+    if (!video && progressIdleSeconds * 1000 >= VIDEO_STALL_WARNING_MS && !watch.warnedNoVideo) {
+      watch.warnedNoVideo = true;
+      recordDiagnosticEvent('warning', '课程页尚未检测到可监测的video元素；可能是嵌套播放器或尚未加载，需核对页面。', title);
+    }
+    if (video?.paused && stalledSeconds * 1000 >= VIDEO_STALL_WARNING_MS && !watch.warnedVideo && !manualDialog) {
+      watch.warnedVideo = true;
+      recordDiagnosticEvent('warning', `视频持续暂停 ${stalledSeconds} 秒，请检查是否需要人工播放。`, title);
+    }
+    if (!stalled && watch.stallAlertActive && videoAdvanced) {
+      watch.stallAlertActive = false;
+      recordDiagnosticEvent('recovered', `播放器恢复推进，当前视频位置=${videoTime.toFixed(1)}秒。`, title);
+    }
+    if (stalled && !watch.warnedVideo) {
+      watch.stallAlertActive = true;
+      watch.warnedVideo = true;
+      recordDiagnosticEvent('warning', `播放器播放时间 ${stalledSeconds} 秒未推进；视频位置=${videoTime.toFixed(1)}秒，课程进度=${progress || '未知'}`, title);
+    }
+    if (progressIdleSeconds * 1000 >= PLATFORM_PROGRESS_WARNING_MS &&
+        video && !video.paused && now - watch.lastVideoAdvanceAt < 12000 && !watch.warnedProgress) {
+      watch.warnedProgress = true;
+      recordDiagnosticEvent('warning', `视频在播放，但平台进度 ${progressIdleSeconds} 秒未变化，当前=${progress || '未知'}；不自动跳过或认定完成。`, title);
+    }
+    if (!stalled || stalledSeconds * 1000 < VIDEO_RELOAD_MS || watch.recovering || watch.terminal) {
+      if (stalled) state.message = `⚠ 视频卡顿：播放时间停滞 ${stalledSeconds} 秒，课程 ${progress || '未知'}。`;
+      return;
+    }
+    const retry = getPlaybackRetry(title);
+    if (retry.count < MAX_STALL_RELOADS) {
+      watch.recovering = true;
+      state.watchdogReloading = true;
+      writeLocalJson(retry.key, { count: retry.count + 1, at: now });
+      recordDiagnosticEvent('recovery', `播放停滞已达 ${stalledSeconds} 秒，准备执行第 ${retry.count + 1} 次有限刷新；保留平台实际进度。`, title);
+      syncBridge(); // Try to persist the diagnostic immediately before navigation.
+      state.message = '⚠ 播放器停滞，准备刷新一次课程页尝试恢复；不会跳过小节。';
+      updateFloatingUI();
+      setTimeout(() => location.reload(), 3500); // Allow the bridge to receive the event before navigation.
+    } else {
+      watch.terminal = true;
+      state.terminalIssue = `视频持续卡顿（${progress || '进度未知'}）。已达到自动刷新上限；请查看日志并人工检查。`;
+      writeCourseLock('stalled', title);
+      recordDiagnosticEvent('stalled', state.terminalIssue, title);
+      setAutoEnabled(false);
+      state.message = state.terminalIssue;
+      state.diagnostics.status = 'stalled';
+      updateFloatingUI();
+    }
   }
 
   function getStudyMode() {
@@ -448,7 +961,10 @@
       } catch (_ignored) {}
     }
     if (!value) {
-      state.message = '自动学习已暂停；脚本仍在正常运行。';
+      state.message = state.terminalIssue || '自动学习已暂停；脚本仍在正常运行。';
+    } else {
+      state.terminalIssue = '';
+      state.watchdog = null;
     }
     updateFloatingUI();
   }
@@ -764,20 +1280,34 @@
     return context;
   }
 
-  function totalProgress(sections = []) {
-    const bodyText = textOf(document.body);
-    const labeled = bodyText.match(/学习进度\s*[：:]?\s*(\d+(?:\.\d+)?)\s*%/);
-    if (labeled) return `${labeled[1]}%`;
-    const progressElement = document.querySelector(
-      '.progress_num, [class*="total-progress"], [class*="study-progress"]'
-    );
-    const direct = parseProgress(textOf(progressElement));
-    if (direct) return direct;
+  function progressBreakdown(sections = []) {
+    const element = document.querySelector('.progress_num, [class*="total-progress"], [class*="study-progress"]');
+    const siteProgress = parseProgress(textOf(element));
     if (sections.length) {
       const average = sections.reduce((sum, section) => sum + progressNumber(section.progress), 0) / sections.length;
-      return `${Math.round(average)}%`;
+      return { value: `${Math.round(average)}%`, source: 'sections-average', siteProgress };
     }
-    return '';
+    // Avoid matching unrelated 99% text from the whole document or a sidebar.
+    return { value: siteProgress, source: siteProgress ? 'course-element' : 'unknown', siteProgress };
+  }
+
+  function totalProgress(sections = []) {
+    return progressBreakdown(sections).value;
+  }
+
+  function updateProgressSource(sections, courseTitle) {
+    const result = progressBreakdown(sections);
+    state.progressMeta = result;
+    const disparity = result.siteProgress && result.source === 'sections-average' &&
+      Math.abs(progressNumber(result.siteProgress) - progressNumber(result.value)) >= 10;
+    const mismatchKey = `${courseTitle}|${result.siteProgress}|${result.value}`;
+    if (disparity && state.lastMismatchKey !== mismatchKey) {
+      state.lastMismatchKey = mismatchKey;
+      recordDiagnosticEvent('progress-source',
+        `网页课程进度=${result.siteProgress}，小节平均=${result.value}；以小节进度为监测依据，不覆盖平台记录。`, courseTitle);
+    }
+    if (!disparity) state.lastMismatchKey = '';
+    return result.value;
   }
 
   function currentCourseTitle() {
@@ -804,8 +1334,8 @@
     if (getStudyMode() === 'special' && /\/trainDetail(?:\/|$|\?|#)/i.test(path)) return 'special-class';
     if (/detail/i.test(path)) return 'detail';
 
-    if (/\/person(?:\/|$|\?|#)/i.test(path)) return 'person';
-
+    // SPA: the site can display the special-class course pane on /person.
+    // Do not classify by the address bar before inspecting verified class UI.
     const studyMode = getStudyMode();
     if (studyMode === 'special') {
       if (pageLooksLikeSpecialClassCourseList()) return 'special-class';
@@ -814,6 +1344,7 @@
       if (readSpecialClassContext() && collectSpecialCourses().length > 0) return 'special-class';
     }
 
+    if (/\/person(?:\/|$|\?|#)/i.test(path)) return 'person';
     if (/person/i.test(path)) return 'person';
     if (document.querySelector('.user_my_nav_li, .user_my_main_body_ul_li_1')) return 'person';
     return 'other';
@@ -876,6 +1407,8 @@
           .course-row button:disabled { cursor:default; opacity:.45; }
           #toggle { width:100%; margin-top:7px; }
           button.stop { background:#ef4444; }
+          #retryStalled { display:none; width:100%; margin-top:7px; background:#b45309; }
+          #resetWorkflow { width:100%; margin-top:7px; background:#64748b; }
         </style>
         <div class="box">
           <div class="head">
@@ -893,6 +1426,8 @@
             <button id="restoreSkip" type="button">恢复上次跳过</button>
           </div>
           <button id="toggle" type="button">暂停当前模式</button>
+          <button id="retryStalled" type="button">异常课程已处理，手动重试</button>
+          <button id="resetWorkflow" type="button">切换账号后清理旧课程状态</button>
         </div>`;
       shadow.getElementById('normalMode').addEventListener('click', () => selectStudyMode('normal'));
       shadow.getElementById('specialMode').addEventListener('click', () => selectStudyMode('special'));
@@ -906,6 +1441,29 @@
       shadow.getElementById('restoreSkip').addEventListener('click', () => {
         const restored = restoreLastSpecialSkip(specialClassKey());
         if (restored) state.message = `已恢复课程：${restored.title}`;
+        updateFloatingUI();
+      });
+      shadow.getElementById('retryStalled').addEventListener('click', () => {
+        const lock = readCourseLock();
+        if (lock?.status !== 'stalled') return;
+        if (!window.confirm('请先确认已检查课程页、平台进度和必要的人工提示，且已关闭旧的异常课程窗口。是否清除异常锁并重新尝试？')) return;
+        recordDiagnosticEvent('manual', `人工确认并清除异常课程锁：${lock.title}`, lock.title);
+        clearCourseLock();
+        removeLocalValue(playbackRetryKey(lock.title));
+        state.watchdog = null;
+        state.terminalIssue = '';
+        setAutoEnabled(true);
+        state.message = '已人工重置异常课程锁；重新核对课程真实学习进度后继续。';
+        updateFloatingUI();
+      });
+      shadow.getElementById('resetWorkflow').addEventListener('click', () => {
+        if (!window.confirm('仅清理本机旧课程锁与专题班导航缓存，保留当前学习模式和手动跳过记录；不会修改网院服务器进度。确认清理？')) return;
+        clearAccountWorkflow(false);
+        state.accountInvalidated = false;
+        state.accountKey = accountFingerprint();
+        if (state.accountKey) writeLocalJson(STORAGE_KEY_ACCOUNT_SCOPE, { key: state.accountKey, at: Date.now() });
+        state.message = '已清除旧课程状态。请在当前账号中重新进入专题班课程列表。';
+        recordDiagnosticEvent('manual', '手动清理旧课程状态与专题班导航缓存。', '');
         updateFloatingUI();
       });
       shadow.getElementById('toggle').addEventListener('click', () => {
@@ -929,6 +1487,8 @@
     const info = root.getElementById('info');
     const bridge = root.getElementById('bridge');
     const toggle = root.getElementById('toggle');
+    root.getElementById('retryStalled').style.display =
+      readCourseLock()?.status === 'stalled' ? 'block' : 'none';
     const normalMode = root.getElementById('normalMode');
     const specialMode = root.getElementById('specialMode');
     const inDetail = state.mode === 'detail' || isSpecialDetailRoute();
@@ -1084,14 +1644,20 @@
       return;
     }
     const sections = getSections();
-    const progress = totalProgress(sections);
     const title = currentCourseTitle();
+    const progress = updateProgressSource(sections, title);
     const specialReturn = resolvedCourseReturnContext();
     const lockTitle = specialReturn?.kind === 'special' && specialReturn.courseTitle
       ? specialReturn.courseTitle : title;
     state.courseTitle = title;
     state.progress = progress;
     state.courses = [];
+
+    // Avoid reclaiming a course lock while a frozen page is being closed.
+    if (state.watchdogReloading || state.watchdog?.recovering || state.watchdog?.terminal) {
+      state.message = state.terminalIssue || '冻结恢复处理中：等待课程页返回专题班列表。';
+      return;
+    }
 
     // Keep the completion lock until the return timer fires. Rewriting it as
     // active on the next polling tick makes the list open the same course again.
@@ -1116,7 +1682,7 @@
       return;
     }
 
-    writeCourseLock('active', lockTitle);
+    writeCourseLock('active', lockTitle, false);
     const videos = Array.from(document.querySelectorAll('video'));
     if (videos.length && videos.every((video) => video.ended)) {
       if (!state.endedVideoAt) state.endedVideoAt = Date.now();
@@ -1151,6 +1717,7 @@
     } else {
       state.message = `正在学习：${title || '当前课程'}\n进度：${progress || '等待平台更新'}`;
     }
+    observePlaybackHealth(sections, progress, lockTitle);
   }
 
   function handleSpecialClassListPage() {
@@ -1242,9 +1809,11 @@
     }
     if (courseLock) {
       const lockTitle = courseLock.title || '当前课程';
-      state.message = courseLock.status === 'active'
-        ? `专题班课程正在学习：${lockTitle}\n完成后将自动返回班级继续下一门。`
-        : `正在打开专题班课程：${lockTitle}\n已阻止重复打开。`;
+      state.message = courseLock.status === 'stalled'
+        ? `⚠ 专题班课程“${lockTitle}”播放异常，已暂停自动切课，请检查课程页。`
+        : courseLock.status === 'active'
+          ? `专题班课程正在学习：${lockTitle}\n完成后将自动返回班级继续下一门。`
+          : `正在打开专题班课程：${lockTitle}\n已阻止重复打开。`;
       return;
     }
     state.personReloading = false;
@@ -1346,9 +1915,11 @@
     }
     if (courseLock) {
       const lockTitle = courseLock.title || '当前课程';
-      state.message = courseLock.status === 'active'
-        ? `已有课程正在学习：${lockTitle}\n完成或关闭后才会打开下一门。`
-        : `正在打开课程：${lockTitle}\n已阻止重复打开新标签页。`;
+      state.message = courseLock.status === 'stalled'
+        ? `⚠ 课程“${lockTitle}”播放异常，已暂停自动切课；请检查课程页。`
+        : courseLock.status === 'active'
+          ? `已有课程正在学习：${lockTitle}\n完成或关闭后才会打开下一门。`
+          : `正在打开课程：${lockTitle}\n已阻止重复打开新标签页。`;
       return;
     }
     state.personReloading = false;
@@ -1404,7 +1975,7 @@
     if (!lock) return null;
     const age = Date.now() - lock.at;
     const timeout = lock.status === 'launching' ? COURSE_LAUNCH_TIMEOUT : COURSE_ACTIVE_TIMEOUT;
-    if (lock.status === 'completed' || lock.status === 'closed') return lock;
+    if (['completed', 'closed', 'stalled'].includes(lock.status)) return lock;
     if ((lock.status === 'launching' || lock.status === 'active') && age < timeout) return lock;
     clearCourseLock();
     return null;
@@ -1483,12 +2054,12 @@
 
   function handleNormalDetailPage304() {
     const sections = getSections();
-    const progress = totalProgress(sections);
     const title = currentCourseTitle();
+    const progress = updateProgressSource(sections, title);
     state.courseTitle = title;
     state.progress = progress;
     state.courses = [];
-    writeCourseLock('active', title);
+    writeCourseLock('active', title, false);
 
     const allDone =
       progressNumber(progress) >= 100 ||
@@ -1525,6 +2096,7 @@
     } else {
       state.message = `正在学习：${title || '当前课程'}\n进度：${progress || '等待平台更新'}`;
     }
+    observePlaybackHealth(sections, progress, title);
   }
 
   function handleNormalPersonPage304() {
@@ -1601,6 +2173,9 @@
 
     if (location.href !== state.lastUrl) {
       state.lastUrl = location.href;
+      state.watchdog = null;
+      state.diagnostics = {};
+      state.progressMeta = { source: 'unknown', siteProgress: '' };
       state.actionLockedUntil = 0;
       state.closingCourse = false;
       state.modeEnteredAt = Date.now();
@@ -1609,7 +2184,12 @@
     const previousMode = state.mode;
     const studyMode = getStudyMode();
     state.mode = studyMode === 'normal' ? detectNormalMode304() : detectMode();
-    if (state.mode !== previousMode) state.modeEnteredAt = Date.now();
+    if (state.mode !== previousMode) {
+      state.modeEnteredAt = Date.now();
+      state.watchdog = null;
+      state.diagnostics = {};
+    }
+    if (!checkAccountSwitch()) { updateFloatingUI(); return; }
     if (studyMode === 'idle') {
       state.courseTitle = '';
       state.progress = '';
@@ -1619,7 +2199,7 @@
       return;
     }
     if (!getAutoEnabled()) {
-      state.message = '当前学习模式已暂停；脚本仍在正常运行。';
+      state.message = state.terminalIssue || '当前学习模式已暂停；脚本仍在正常运行。';
       updateFloatingUI();
       return;
     }
@@ -1690,11 +2270,13 @@
   }
 
   function bridgeReport() {
+    identifySpecialChild();
     return {
       url: location.href,
       pageTitle: document.title,
       mode: state.mode,
       userName: getUserName(),
+      accountKey: state.accountKey,
       courseTitle: state.courseTitle,
       progress: state.progress,
       message: state.message,
@@ -1702,10 +2284,20 @@
       studyMode: getStudyMode(),
       courses: state.courses,
       scriptVersion: VERSION,
+      tabId: TAB_ID,
+      classId: new URL(location.href).searchParams.get('trainClassId') || '',
+      courseKey: state.mode === 'detail' ? (resolvedCourseReturnContext()?.courseTitle || readCourseLock()?.title || state.courseTitle) : '',
+      recoveryAck: state.recoveryAck,
+      progressSource: state.mode === 'detail' ? (state.progressMeta?.source || 'unknown') : '',
+      siteProgress: state.mode === 'detail' ? (state.progressMeta?.siteProgress || '') : '',
+      diagnostics: state.diagnostics,
+      events: state.pendingEvents.slice(),
     };
   }
 
   function applyBridgeCommands(data) {
+    state.desktopGuardianAvailable = data.appVersion === '3.3.5' && data.guardianAvailable === true;
+    if (data.recoveryRequest) handleDesktopRecovery(data.recoveryRequest);
     const commandRevision = Number(data.commandRevision || 0);
     if (state.lastCommandRevision === null || commandRevision !== state.lastCommandRevision) {
       state.lastCommandRevision = commandRevision;
@@ -1739,10 +2331,14 @@
     let connected = false;
     for (const url of urls) {
       try {
-        const data = await requestBridge(url, bridgeReport());
+        const report = bridgeReport();
+        const data = await requestBridge(url, report);
         state.preferredBridge = url;
         state.bridgeConnected = true;
         applyBridgeCommands(data);
+        // Remove only events submitted by this request. New events remain queued.
+        const submitted = new Set(report.events.map((item) => item.id));
+        state.pendingEvents = state.pendingEvents.filter((item) => !submitted.has(item.id));
         connected = true;
         break;
       } catch (_error) {}
@@ -1757,11 +2353,17 @@
     if (IS_TOP) {
       window.addEventListener('pagehide', releaseOwnedCourseLock);
       window.addEventListener('beforeunload', releaseOwnedCourseLock);
+      setupSpecialPopupOwnership();
       ensureFloatingUI();
       automationTick();
       syncBridge();
       setInterval(automationTick, 2500);
       setInterval(syncBridge, 3000);
+      window.addEventListener('pageshow', () => { automationTick(); syncBridge(); });
+      window.addEventListener('focus', () => { automationTick(); syncBridge(); });
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) { automationTick(); syncBridge(); }
+      });
       new MutationObserver(() => ensureFloatingUI()).observe(document.documentElement, {
         childList: true,
         subtree: true,
